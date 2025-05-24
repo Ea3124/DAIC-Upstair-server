@@ -1,0 +1,22 @@
+# Python 기본
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+*.sqlite3
+
+# 가상환경
+venv/
+env/
+.python-version
+
+# 에디터 설정
+.vscode/
+.idea/
+
+# OS 별 임시파일
+.DS_Store
+Thumbs.db
+
+# 로그
+*.log

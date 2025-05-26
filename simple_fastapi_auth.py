@@ -1,122 +1,165 @@
-## 실행 : uvicorn simple_fastapi_auth:app --reload
+"""
+실행 예시
+---------
+$ uvicorn simple_fastapi_auth:app --reload
+"""
+
+from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
-import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from pathlib import Path
+from dotenv import load_dotenv
+import mimetypes
+import requests
+import os
+import logging
 
-# FastAPI 애플리케이션 생성
+# ──────────────────────────── 환경설정 ────────────────────────────
+load_dotenv()                                   # .env → 환경변수 반영
+UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")  # 必
+
+if not UPSTAGE_API_KEY:
+    raise RuntimeError("환경변수 UPSTAGE_API_KEY 가 설정되지 않았습니다.")
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(levelname)s | %(message)s")
+
+# ──────────────────────────── FastAPI ────────────────────────────
 app = FastAPI(title="PNU Scholarship Parser API")
 
-# 인메모리 저장소: parsed_docs[id] = {"title": ..., "content_html": ...}
-parsed_docs = {}
-next_id = 1  # 문서 ID 부여용
+# 인메모리 DB
+parsed_docs: dict[int, dict[str, str]] = {}   # {id: {"title":.., "content_html":..}}
+next_id: int = 1
 
-# 환경 변수 또는 설정 파일에서 Upstage API 키 불러오기
-UPSTAGE_API_KEY = "YOUR_API_KEY_HERE"  # 실제 키로 교체하거나 환경변수 사용
 
-# [보조 함수] 장학공지 게시판 크롤링 및 파싱 함수
-import requests
-from bs4 import BeautifulSoup
+# ──────────────────────────── 유틸 ────────────────────────────────
+def guess_mime(fname: str) -> str:
+    """
+    파일 이름에서 MIME 타입 추정 (mimetypes + 확장자 보정)
+    """
+    mime, _ = mimetypes.guess_type(fname)
+    if mime:
+        return mime
+    ext = Path(fname).suffix.lower()
+    return {
+        ".hwp":  "application/x-hwp",
+        ".hwpx": "application/x-hwp",
+    }.get(ext, "application/octet-stream")
 
-# [중략: FastAPI, imports, etc.]
 
-def crawl_and_parse():
+def call_upstage(file_name: str, file_bytes: bytes) -> dict:
+    """
+    Upstage Document-Parse 동기 API 호출 후 JSON 반환
+    """
+    api_url = "https://api.upstage.ai/v1/document-digitization"
+    headers = {"Authorization": f"Bearer {UPSTAGE_API_KEY}"}
+
+    files = {
+        "document": (file_name, file_bytes, guess_mime(file_name))
+    }
+    data = {
+        "model": "document-parse"      # 필수
+        # 필요 시 "ocr": "force", "base64_encoding": "['table']" 등 추가
+    }
+
+    resp = requests.post(api_url, headers=headers, files=files, data=data, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ──────────────────────────── 크롤러 ─────────────────────────────
+def crawl_and_parse() -> None:
+    """
+    부산대 CSE 게시판을 돌며 첨부파일 → Upstage 변환 → HTML 저장
+    """
     global next_id
     base_url = "https://cse.pusan.ac.kr"
     list_url = f"{base_url}/bbs/cse/2605/artclList.do"
     headers = {"User-Agent": "Mozilla/5.0"}
     session = requests.Session()
 
-    print("[START] 크롤링 시작")
-    resp = session.get(list_url, headers=headers)
-    print(f"[DEBUG] 목록 페이지 status: {resp.status_code}")
+    logging.info("[START] 크롤링 시작")
+    resp = session.get(list_url, headers=headers, timeout=15)
+    logging.debug(f"[DEBUG] 목록 페이지 status: {resp.status_code}")
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
     articles = soup.select("td._artclTdTitle a.artclLinkView")
-    print(f"[INFO] 게시글 수: {len(articles)}")
+    logging.info(f"[INFO] 게시글 수: {len(articles)}")
 
     for a in articles:
-        try:
-            title = a.get_text(strip=True)
-            detail_url = urljoin(base_url, a["href"])
-            print(f"[INFO] 처리 중: {title}")
+        title = a.get_text(strip=True)
+        detail_url = urljoin(base_url, a["href"])
+        logging.info(f"[INFO] 처리 중: {title}")
 
-            # 상세 페이지
-            detail_resp = session.get(detail_url, headers=headers)
+        try:
+            # ── 상세 페이지 ──
+            detail_resp = session.get(detail_url, headers=headers, timeout=15)
             detail_resp.raise_for_status()
             detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
 
-            # ⬇ 첨부파일 링크 (.pdf·.hwp 등) ― href에 /download.do 포함
             file_links = detail_soup.select(
-                'dl.artclForm dd.artclInsert li a[href*="/download.do"]'
-            )
-            print(f"[DEBUG] 첨부파일 수: {len(file_links)}")
+                'dl.artclForm dd.artclInsert li a[href*="/download.do"]')
+            logging.debug(f"[DEBUG] 첨부파일 수: {len(file_links)}")
             if not file_links:
-                continue  # 첨부파일 없으면 건너뜀
+                continue
 
-            # 첫 번째 첨부파일만 처리 (필요하면 for file_link in file_links 반복)
-            file_link = file_links[0]
-            file_name = file_link.get_text(strip=True)
-            file_url = urljoin(detail_url, file_link["href"])
+            file_link  = file_links[0]              # 첫 파일만
+            file_name  = file_link.get_text(strip=True)
+            file_url   = urljoin(detail_url, file_link["href"])
 
-            # 파일 다운로드
-            file_resp = session.get(file_url, headers=headers)
+            file_resp = session.get(file_url, headers=headers, timeout=30)
             file_resp.raise_for_status()
-            file_content = file_resp.content
 
-            # Upstage Document Parser
-            api_url = "https://api.upstage.ai/v1/document-ai/document-parse"
-            api_headers = {"Authorization": f"Bearer {UPSTAGE_API_KEY}"}
-            files = {"document": file_content}
-            api_resp = requests.post(api_url, headers=api_headers, files=files)
-            api_resp.raise_for_status()
-            result_json = api_resp.json()
+            # ── Upstage 변환 ──
+            result_json = call_upstage(file_name, file_resp.content)
 
-            # HTML 추출
-            elements = result_json.get("elements", [])
             html_segments = [
-                elem["content"].get("html", "") for elem in elements if "content" in elem
+                elem["content"]["html"]
+                for elem in result_json.get("elements", [])
+                if "content" in elem
             ]
-            full_html = "\n".join(html_segments)
+            full_html = "\n".join(html_segments) or "<p>(빈 문서)</p>"
 
-            # 메모리 저장
             parsed_docs[next_id] = {
                 "title": f"{title} ({file_name})" if file_name else title,
                 "content_html": full_html,
             }
-            print(f"[✅ 저장됨] ID {next_id} - {title}")
+            logging.info(f"[✅ 저장] ID {next_id} - {title}")
             next_id += 1
 
         except Exception as e:
-            print(f"[ERROR] {title} 처리 중 오류 발생: {e}")
+            logging.error(f"[ERROR] {title} 처리 중 오류: {e}")
 
 
-
-
-# API 엔드포인트 구현
-
+# ──────────────────────────── API 엔드포인트 ─────────────────────
 @app.get("/scholarships")
-def list_scholarships():
-    """저장된 모든 장학 공지 문서 목록 반환"""
-    result = []
-    for doc_id, doc in parsed_docs.items():
-        result.append({"id": doc_id, "title": doc["title"]})
-    return result
+def list_scholarships() -> list[dict]:
+    """
+    저장된 문서 목록
+    """
+    return [{"id": doc_id, "title": doc["title"]}
+            for doc_id, doc in parsed_docs.items()]
+
 
 @app.get("/scholarships/{doc_id}")
-def get_scholarship(doc_id: int):
-    """지정한 ID의 장학 공지 문서 내용 반환 (HTML)"""
+def get_scholarship(doc_id: int) -> dict:
+    """
+    지정 ID 문서의 HTML 반환
+    """
     doc = parsed_docs.get(doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    # HTML 콘텐츠를 응답 (필요하다면 text/plain으로 변환 가능)
+        raise HTTPException(404, "Document not found")
     return {"id": doc_id, "title": doc["title"], "content_html": doc["content_html"]}
 
+
 @app.post("/scholarships/refresh")
-def refresh_scholarships():
-    """장학 공지사항 게시판을 크롤링하여 최신 문서 파싱 (기존 데이터 초기화)"""
+def refresh_scholarships() -> dict:
+    """
+    게시판 재크롤링 - 메모리 초기화
+    """
     parsed_docs.clear()
     global next_id
     next_id = 1
@@ -124,7 +167,8 @@ def refresh_scholarships():
         crawl_and_parse()
         return {"status": "success", "count": len(parsed_docs)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
-# (옵션) 서버 시작 시 자동 크롤링 수행
+
+# ──────────────────────────── (옵션) 서버 기동 시 자동 수집 ─────
 # crawl_and_parse()
